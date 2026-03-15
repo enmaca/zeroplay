@@ -206,7 +206,6 @@ No X11, no Wayland, no GPU compositing. Runs directly on the framebuffer from a 
 | Dual display | No | Yes (Pi 4) |
 | Playlist / directory | No | Yes |
 | Image display | No | Yes |
-| Multi-Pi sync | Yes (omxplayer-sync) | Yes |
 | Subtitles | Yes | No |
 | Chapter skip | No | Yes |
 | Seeking | Yes | Yes |
