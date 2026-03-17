@@ -263,7 +263,7 @@ void audio_run(AudioContext *ctx)
                                         (const uint8_t **)frame->data,
                                         frame->nb_samples);
 
-            if (converted > 0) {
+            if (converted > 0 && out_buf) {
                 /* Apply software volume gain or mute */
                 float gain = ctx->muted ? 0.0f : ctx->volume;
                 if (gain != 1.0f) {
@@ -281,14 +281,27 @@ void audio_run(AudioContext *ctx)
                     snd_pcm_writei(ctx->pcm, out_buf,
                                    (snd_pcm_uframes_t)converted);
 
-                if (written == -EPIPE) {
-                    snd_pcm_prepare(ctx->pcm);
-                    snd_pcm_writei(ctx->pcm, out_buf,
-                                   (snd_pcm_uframes_t)converted);
-                    written = converted;
-                } else if (written < 0 && !ctx->paused) {
-                    fprintf(stderr, "audio: write error: %s\n",
-                            snd_strerror((int)written));
+                if (written < 0) {
+                    /* Use snd_pcm_recover for robust error handling.
+                     * This handles EPIPE (underrun), ESTRPIPE (suspend),
+                     * and EINTR.  For other errors (EFAULT, EBADFD) we
+                     * try a manual prepare cycle. */
+                    int rc = snd_pcm_recover(ctx->pcm, (int)written, 1);
+                    if (rc < 0) {
+                        /* recover() failed — force prepare and retry */
+                        snd_pcm_drop(ctx->pcm);
+                        snd_pcm_prepare(ctx->pcm);
+                    }
+                    /* Retry the write once after recovery */
+                    written = snd_pcm_writei(ctx->pcm, out_buf,
+                                             (snd_pcm_uframes_t)converted);
+                    if (written < 0 && !ctx->paused) {
+                        /* Still failing — rate-limit logging */
+                        static int err_count = 0;
+                        if (++err_count <= 3 || err_count % 100 == 0)
+                            fprintf(stderr, "audio: write error (%d): %s\n",
+                                    err_count, snd_strerror((int)written));
+                    }
                 }
 
                 if (written > 0)

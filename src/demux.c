@@ -29,20 +29,45 @@ int demux_open(DemuxContext *ctx, const char *filename,
     }
     av_dict_free(&opts);
 
+    /* Reduce memory footprint during stream analysis — important on Pi Zero
+     * where RAM is very limited (512MB total).  Default probesize is 5MB and
+     * analyzeduration is 5s; lowering them saves several MB of read-ahead
+     * buffers when opening HLS streams with multiple variants. */
+    ctx->fmt_ctx->probesize          = 1 * 1024 * 1024;   /* 1 MB */
+    ctx->fmt_ctx->max_analyze_duration = 3 * AV_TIME_BASE; /* 3 seconds */
+
     if (avformat_find_stream_info(ctx->fmt_ctx, NULL) < 0) {
         fprintf(stderr, "demux: could not find stream info\n");
         return -1;
     }
 
+    /* Select streams — prefer H.264 video over HEVC/other codecs that the
+     * Pi Zero's V4L2 M2M decoder doesn't support. */
     for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
         AVCodecParameters *par = ctx->fmt_ctx->streams[i]->codecpar;
         if (par->codec_type == AVMEDIA_TYPE_VIDEO &&
-            ctx->video_stream_idx == -1)
+            ctx->video_stream_idx == -1 &&
+            par->codec_id == AV_CODEC_ID_H264)
             ctx->video_stream_idx = (int)i;
 
         if (par->codec_type == AVMEDIA_TYPE_AUDIO &&
             ctx->audio_stream_idx == -1)
             ctx->audio_stream_idx = (int)i;
+    }
+
+    /* Fallback: if no H.264 stream found, take the first video stream
+     * so we at least report the codec to the user. */
+    if (ctx->video_stream_idx == -1) {
+        for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
+            AVCodecParameters *par = ctx->fmt_ctx->streams[i]->codecpar;
+            if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+                ctx->video_stream_idx = (int)i;
+                fprintf(stderr, "demux: WARNING — no H.264 stream found, "
+                        "selected %s (may not decode on V4L2 M2M)\n",
+                        avcodec_get_name(par->codec_id));
+                break;
+            }
+        }
     }
 
     if (ctx->video_stream_idx == -1) {

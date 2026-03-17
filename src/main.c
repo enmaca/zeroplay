@@ -652,6 +652,7 @@ static int run_ws_mode(Options *opt)
     player.no_audio   = opt->no_audio;
 
     int paused = 0;
+    int audio_started = 0;   /* defer audio until first DRM frame */
 
     fprintf(stderr, "zeroplay: ws mode — idle, waiting for commands\n");
 
@@ -664,12 +665,20 @@ static int run_ws_mode(Options *opt)
                 fprintf(stderr, "zeroplay: load %s\n", cmd.url);
                 player_close_pipeline(&player);
                 paused = 0;
+                audio_started = 0;
                 if (player_open_video(&player, cmd.url, opt) < 0) {
                     fprintf(stderr, "zeroplay: failed to open %s\n", cmd.url);
                     ws_shared_state_set_idle(&shared, 1);
                     ws_shared_state_set_url(&shared, NULL);
                     ws_shared_state_set_position(&shared, -1.0);
                 } else {
+                    /* Pause audio BEFORE starting threads so the audio
+                     * thread blocks immediately.  We unpause after the
+                     * first DRM frame is presented — this avoids writing
+                     * to the HDMI ALSA device while DRM is still
+                     * configuring the connector. */
+                    if (player.audio_active)
+                        audio_pause(&player.audio);
                     player_threads_start(&player);
                     ws_shared_state_set_idle(&shared, 0);
                     ws_shared_state_set_url(&shared, cmd.url);
@@ -682,7 +691,7 @@ static int run_ws_mode(Options *opt)
                     paused = 0;
                     if (player.held_frame)
                         player.wall_start = now_us() - player.held_frame->pts_us;
-                    if (player.audio_active)
+                    if (player.audio_active && audio_started)
                         audio_resume(&player.audio);
                     ws_shared_state_set_paused(&shared, 0);
                     fprintf(stderr, "zeroplay: play\n");
@@ -780,6 +789,15 @@ static int run_ws_mode(Options *opt)
 
         if (due <= now) {
             drm_present(&drm, 0, frame);
+
+            /* Start audio after first frame is on screen — the HDMI
+             * output is now stable so ALSA writes won't get EFAULT. */
+            if (!audio_started && p->audio_active && !paused) {
+                audio_resume(&p->audio);
+                audio_started = 1;
+                fprintf(stderr, "zeroplay: audio started (after first frame)\n");
+            }
+
             p->held_frame = NULL;
             if (p->prev_frame)
                 vdec_requeue_frame(&p->vdec, p->prev_frame);
