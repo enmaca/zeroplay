@@ -62,6 +62,62 @@ static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx)
 }
 
 /* ------------------------------------------------------------------ */
+/* Probe the raw ALSA hardware for its native sample rate.             */
+/*                                                                     */
+/* plughw: silently resamples audio to the hardware's native rate,     */
+/* but on the Pi's vc4-hdmi this conversion can introduce pitch        */
+/* distortion ("chipmunk" effect).  By discovering the real hardware   */
+/* rate we can let libswresample do a correct conversion and feed      */
+/* ALSA at the rate it actually runs at — no plughw conversion.        */
+/* ------------------------------------------------------------------ */
+
+static int probe_native_rate(const char *dev_name,
+                             unsigned int target, int channels)
+{
+    /* Build the raw hw: name from plughw: (or hw: as-is) */
+    char hw_name[64];
+    if (strncmp(dev_name, "plughw:", 7) == 0)
+        snprintf(hw_name, sizeof(hw_name), "hw:%s", dev_name + 7);
+    else if (strncmp(dev_name, "hw:", 3) == 0)
+        snprintf(hw_name, sizeof(hw_name), "%s", dev_name);
+    else
+        return (int)target;   /* unknown device type — keep target */
+
+    snd_pcm_t *pcm = NULL;
+    if (snd_pcm_open(&pcm, hw_name, SND_PCM_STREAM_PLAYBACK, 0) < 0) {
+        fprintf(stderr, "audio: probe — cannot open %s, using %u Hz\n",
+                hw_name, target);
+        return (int)target;
+    }
+
+    snd_pcm_hw_params_t *params;
+    snd_pcm_hw_params_alloca(&params);
+    snd_pcm_hw_params_any(pcm, params);
+
+    snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(pcm, params, ALSA_FORMAT);
+    snd_pcm_hw_params_set_channels(pcm, params, (unsigned int)channels);
+
+    /* Log supported rate range */
+    unsigned int rate_min = 0, rate_max = 0;
+    snd_pcm_hw_params_get_rate_min(params, &rate_min, NULL);
+    snd_pcm_hw_params_get_rate_max(params, &rate_max, NULL);
+
+    /* Find nearest supported rate to our target */
+    unsigned int rate = target;
+    int dir = 0;
+    snd_pcm_hw_params_set_rate_near(pcm, params, &rate, &dir);
+
+    snd_pcm_close(pcm);
+
+    fprintf(stderr, "audio: hw probe %s — hw rates %u..%u Hz, "
+            "target=%u → nearest=%u\n",
+            hw_name, rate_min, rate_max, target, rate);
+
+    return (int)rate;
+}
+
+/* ------------------------------------------------------------------ */
 /* ALSA device open / reopen                                           */
 /* ------------------------------------------------------------------ */
 
@@ -87,10 +143,11 @@ static int alsa_open_device(AudioContext *ctx)
     snd_pcm_hw_params_set_channels(ctx->pcm, hw_params,
                                    (unsigned int)ctx->channels);
 
-    unsigned int rate = (unsigned int)ctx->sample_rate;
+    unsigned int rate = (unsigned int)ctx->alsa_rate;
     snd_pcm_hw_params_set_rate_near(ctx->pcm, hw_params, &rate, 0);
+    ctx->alsa_rate = (int)rate;   /* store actual negotiated rate */
 
-    snd_pcm_uframes_t buffer_size = (snd_pcm_uframes_t)(ctx->sample_rate / 5);
+    snd_pcm_uframes_t buffer_size = (snd_pcm_uframes_t)(ctx->alsa_rate / 5);
     snd_pcm_uframes_t period_size = buffer_size / 4;
     snd_pcm_hw_params_set_buffer_size_near(ctx->pcm, hw_params, &buffer_size);
     snd_pcm_hw_params_set_period_size_near(ctx->pcm, hw_params,
@@ -187,6 +244,13 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     }
 
     /* ------------------------------------------------------------------ */
+    /* 0. Probe hardware native rate so we can bypass plughw resampling    */
+    /* ------------------------------------------------------------------ */
+    ctx->alsa_rate = probe_native_rate(ctx->device,
+                                       (unsigned int)ctx->sample_rate,
+                                       ctx->channels);
+
+    /* ------------------------------------------------------------------ */
     /* 1. Initialise libavcodec audio decoder                              */
     /* ------------------------------------------------------------------ */
     const AVCodec *codec = avcodec_find_decoder(stream->codecpar->codec_id);
@@ -231,7 +295,7 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     av_opt_set_sample_fmt(ctx->swr_ctx, "in_sample_fmt",
                           ctx->codec_ctx->sample_fmt, 0);
     av_opt_set_int       (ctx->swr_ctx, "out_sample_rate",
-                          ctx->sample_rate, 0);
+                          ctx->alsa_rate, 0);
     av_opt_set_sample_fmt(ctx->swr_ctx, "out_sample_fmt",
                           AV_OUT_FORMAT, 0);
 
@@ -239,6 +303,10 @@ int audio_open(AudioContext *ctx, AVStream *stream,
         fprintf(stderr, "audio: failed to init swresample\n");
         return -1;
     }
+
+    if (ctx->alsa_rate != ctx->sample_rate)
+        fprintf(stderr, "audio: resampling %d → %d Hz (hw native rate)\n",
+                ctx->sample_rate, ctx->alsa_rate);
 
     /* ------------------------------------------------------------------ */
     /* 3. Open ALSA PCM device                                             */
@@ -318,18 +386,19 @@ void audio_run(AudioContext *ctx)
             if (total_frames == 1) {
                 fprintf(stderr,
                     "audio: first decoded frame — fmt=%s rate=%d ch=%d "
-                    "samples=%d (configured: rate=%d ch=%d)\n",
+                    "samples=%d (codec=%d alsa=%d ch=%d)\n",
                     av_get_sample_fmt_name(frame->format),
                     frame->sample_rate,
                     get_frame_channels(frame),
                     frame->nb_samples,
                     ctx->sample_rate,
+                    ctx->alsa_rate,
                     ctx->channels);
 
                 /* Warn if decoded format doesn't match configured */
                 if (frame->sample_rate != ctx->sample_rate) {
                     fprintf(stderr,
-                        "audio: WARNING — frame rate %d != configured %d "
+                        "audio: WARNING — frame rate %d != codec rate %d "
                         "(potential HE-AAC SBR mismatch)\n",
                         frame->sample_rate, ctx->sample_rate);
                 }
@@ -449,7 +518,7 @@ long long audio_get_clock_us(AudioContext *ctx)
     long long played_frames = ctx->frames_written - delay;
     if (played_frames < 0) played_frames = 0;
 
-    return played_frames * 1000000LL / ctx->sample_rate;
+    return played_frames * 1000000LL / ctx->alsa_rate;
 }
 
 /* ------------------------------------------------------------------ */
