@@ -121,15 +121,15 @@ static int probe_native_rate(const char *dev_name,
 /* ALSA device open / reopen                                           */
 /* ------------------------------------------------------------------ */
 
-static int alsa_open_device(AudioContext *ctx)
+static int alsa_setup_device(AudioContext *ctx, const char *dev_name,
+                             snd_pcm_format_t fmt)
 {
     int err;
 
-    err = snd_pcm_open(&ctx->pcm, ctx->device,
-                       SND_PCM_STREAM_PLAYBACK, 0);
+    err = snd_pcm_open(&ctx->pcm, dev_name, SND_PCM_STREAM_PLAYBACK, 0);
     if (err < 0) {
         fprintf(stderr, "audio: cannot open device '%s': %s\n",
-                ctx->device, snd_strerror(err));
+                dev_name, snd_strerror(err));
         return -1;
     }
 
@@ -139,13 +139,20 @@ static int alsa_open_device(AudioContext *ctx)
 
     snd_pcm_hw_params_set_access(ctx->pcm, hw_params,
                                  SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(ctx->pcm, hw_params, ALSA_FORMAT);
+    err = snd_pcm_hw_params_set_format(ctx->pcm, hw_params, fmt);
+    if (err < 0) {
+        fprintf(stderr, "audio: device '%s' rejected format %s: %s\n",
+                dev_name, snd_pcm_format_name(fmt), snd_strerror(err));
+        snd_pcm_close(ctx->pcm);
+        ctx->pcm = NULL;
+        return -1;
+    }
     snd_pcm_hw_params_set_channels(ctx->pcm, hw_params,
                                    (unsigned int)ctx->channels);
 
     unsigned int rate = (unsigned int)ctx->alsa_rate;
     snd_pcm_hw_params_set_rate_near(ctx->pcm, hw_params, &rate, 0);
-    ctx->alsa_rate = (int)rate;   /* store actual negotiated rate */
+    ctx->alsa_rate = (int)rate;
 
     snd_pcm_uframes_t buffer_size = (snd_pcm_uframes_t)(ctx->alsa_rate / 5);
     snd_pcm_uframes_t period_size = buffer_size / 4;
@@ -155,8 +162,8 @@ static int alsa_open_device(AudioContext *ctx)
 
     err = snd_pcm_hw_params(ctx->pcm, hw_params);
     if (err < 0) {
-        fprintf(stderr, "audio: cannot set hw params: %s\n",
-                snd_strerror(err));
+        fprintf(stderr, "audio: cannot set hw params on '%s': %s\n",
+                dev_name, snd_strerror(err));
         snd_pcm_close(ctx->pcm);
         ctx->pcm = NULL;
         return -1;
@@ -168,16 +175,29 @@ static int alsa_open_device(AudioContext *ctx)
     snd_pcm_sw_params_set_start_threshold(ctx->pcm, sw_params, period_size);
     snd_pcm_sw_params(ctx->pcm, sw_params);
 
-    /* Log actual negotiated values */
+    /* Log negotiated values */
     snd_pcm_uframes_t actual_buffer = 0, actual_period = 0;
     snd_pcm_hw_params_get_buffer_size(hw_params, &actual_buffer);
     snd_pcm_hw_params_get_period_size(hw_params, &actual_period, NULL);
 
-    vlog("audio: ALSA opened — device=%s rate=%u buffer=%lu period=%lu\n",
-            ctx->device, rate,
+    snd_pcm_format_t actual_fmt;
+    unsigned int actual_ch = 0, actual_rate = 0;
+    snd_pcm_hw_params_get_format(hw_params, &actual_fmt);
+    snd_pcm_hw_params_get_channels(hw_params, &actual_ch);
+    snd_pcm_hw_params_get_rate(hw_params, &actual_rate, NULL);
+
+    fprintf(stderr, "audio: ALSA opened — device=%s rate=%u ch=%u fmt=%s "
+            "buffer=%lu period=%lu\n",
+            dev_name, actual_rate, actual_ch,
+            snd_pcm_format_name(actual_fmt),
             (unsigned long)actual_buffer, (unsigned long)actual_period);
 
     return 0;
+}
+
+static int alsa_open_device(AudioContext *ctx)
+{
+    return alsa_setup_device(ctx, ctx->device, ALSA_FORMAT);
 }
 
 /*
@@ -225,21 +245,47 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     pthread_mutex_init(&ctx->pause_mutex, NULL);
     pthread_cond_init(&ctx->pause_cond, NULL);
 
-    /* Choose device */
+    /* Choose device.
+     *
+     * The Pi's vc4-hdmi ALSA driver exposes HDMI audio as
+     * IEC958_SUBFRAME_LE.  The 'hdmi:' ALSA device name routes through
+     * the iec958 plugin chain defined in vc4-hdmi.conf:
+     *
+     *   plug → softvol → iec958 → hw
+     *
+     * This chain converts standard PCM (S16, S32, etc.) into IEC958
+     * subframes automatically.  Using 'plughw:' would bypass this chain
+     * and cause noise because plughw cannot do S16→IEC958 conversion.
+     *
+     * mpv uses 'default' (which maps to the same chain) — we use the
+     * explicit 'hdmi:' name to avoid dmix and stay closer to hardware. */
     if (device && device[0]) {
         strncpy(ctx->device, device, sizeof(ctx->device) - 1);
     } else {
-        /* Default to vc4hdmi (Pi Zero 2W, Pi 3); fall back to vc4hdmi0
-         * (Pi 4 which has two HDMI ports and numbers them) */
-        snd_pcm_t *test = NULL;
-        if (snd_pcm_open(&test, "plughw:CARD=vc4hdmi,DEV=0",
-                         SND_PCM_STREAM_PLAYBACK, 0) == 0) {
-            snd_pcm_close(test);
-            strncpy(ctx->device, "plughw:CARD=vc4hdmi,DEV=0",
-                    sizeof(ctx->device) - 1);
-        } else {
-            strncpy(ctx->device, "plughw:CARD=vc4hdmi0,DEV=0",
-                    sizeof(ctx->device) - 1);
+        /* Try hdmi: first (goes through iec958 plugin), then plughw: */
+        static const char *try_devices[] = {
+            "hdmi:CARD=vc4hdmi,DEV=0",     /* Pi Zero 2W, Pi 3 */
+            "hdmi:CARD=vc4hdmi0,DEV=0",    /* Pi 4 (HDMI port 0) */
+            "plughw:CARD=vc4hdmi,DEV=0",   /* fallback */
+            "plughw:CARD=vc4hdmi0,DEV=0",  /* fallback */
+            NULL
+        };
+        ctx->device[0] = '\0';
+        for (int i = 0; try_devices[i]; i++) {
+            snd_pcm_t *test = NULL;
+            if (snd_pcm_open(&test, try_devices[i],
+                             SND_PCM_STREAM_PLAYBACK, 0) == 0) {
+                snd_pcm_close(test);
+                strncpy(ctx->device, try_devices[i],
+                        sizeof(ctx->device) - 1);
+                fprintf(stderr, "audio: selected device '%s'\n",
+                        ctx->device);
+                break;
+            }
+        }
+        if (!ctx->device[0]) {
+            fprintf(stderr, "audio: no HDMI audio device found\n");
+            return -1;
         }
     }
 
@@ -402,14 +448,13 @@ void audio_run(AudioContext *ctx)
             if (total_frames == 1) {
                 fprintf(stderr,
                     "audio: first decoded frame — fmt=%s rate=%d ch=%d "
-                    "samples=%d (codec=%d alsa=%d ch=%d)\n",
+                    "samples=%d (codec=%d alsa=%d)\n",
                     av_get_sample_fmt_name(frame->format),
                     frame->sample_rate,
                     get_frame_channels(frame),
                     frame->nb_samples,
                     ctx->sample_rate,
-                    ctx->alsa_rate,
-                    ctx->channels);
+                    ctx->alsa_rate);
 
                 /* Warn if decoded format doesn't match configured */
                 if (frame->sample_rate != ctx->sample_rate) {
@@ -440,14 +485,9 @@ void audio_run(AudioContext *ctx)
                              ? (int)(prev_nb_samples / pts_dur + 0.5)
                              : 0;
 
-                fprintf(stderr,
-                    "audio: PTS rate detect — pts_diff=%lld tb=%d/%d "
-                    "dur=%.6fs samples=%d → detected=%d Hz "
-                    "(configured in=%d out=%d)\n",
-                    (long long)(frame->pts - prev_pts),
-                    ctx->time_base.num, ctx->time_base.den,
-                    pts_dur, prev_nb_samples, detected,
-                    ctx->sample_rate, ctx->alsa_rate);
+                vlog("audio: PTS rate detect — %d Hz "
+                     "(configured %d → %d)\n",
+                     detected, ctx->sample_rate, ctx->alsa_rate);
 
                 /* If the real input rate is significantly different,
                  * reconfigure swr so it resamples correctly. */
@@ -505,16 +545,16 @@ void audio_run(AudioContext *ctx)
                                         frame->nb_samples);
 
             if (converted > 0 && out_buf && ctx->pcm) {
-                /* Apply software volume gain or mute */
+                /* Apply software volume gain or mute (on S16 data) */
+                int16_t *s16_data = (int16_t *)out_buf;
+                int total_samps = converted * ctx->channels;
                 float gain = ctx->muted ? 0.0f : ctx->volume;
                 if (gain != 1.0f) {
-                    int16_t *samples = (int16_t *)out_buf;
-                    int total = converted * ctx->channels;
-                    for (int s = 0; s < total; s++) {
-                        int32_t v = (int32_t)(samples[s] * gain);
+                    for (int s = 0; s < total_samps; s++) {
+                        int32_t v = (int32_t)(s16_data[s] * gain);
                         if (v >  32767) v =  32767;
                         if (v < -32768) v = -32768;
-                        samples[s] = (int16_t)v;
+                        s16_data[s] = (int16_t)v;
                     }
                 }
 
