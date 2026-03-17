@@ -3,12 +3,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <libavutil/opt.h>
+#include <libavutil/samplefmt.h>
 #include <libavutil/version.h>
 
 /* Output format we ask ALSA and swresample to produce */
 #define ALSA_FORMAT     SND_PCM_FORMAT_S16_LE
 #define AV_OUT_FORMAT   AV_SAMPLE_FMT_S16
+
+/* After this many consecutive write errors, attempt to reopen ALSA */
+#define ALSA_REOPEN_THRESHOLD 50
+
+/* Delay (microseconds) before reopening ALSA to let HDMI settle */
+#define ALSA_REOPEN_DELAY_US  200000
 
 /*
  * FFmpeg 5.1 (libavutil 57.28) introduced AVChannelLayout and
@@ -30,6 +38,15 @@ static int get_channels(AVCodecParameters *par)
 #endif
 }
 
+static int get_frame_channels(AVFrame *frame)
+{
+#if HAVE_CH_LAYOUT
+    return frame->ch_layout.nb_channels;
+#else
+    return frame->channels;
+#endif
+}
+
 static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx)
 {
 #if HAVE_CH_LAYOUT
@@ -44,10 +61,99 @@ static void set_swr_layout(SwrContext *swr, AVCodecContext *codec_ctx)
 #endif
 }
 
+/* ------------------------------------------------------------------ */
+/* ALSA device open / reopen                                           */
+/* ------------------------------------------------------------------ */
+
+static int alsa_open_device(AudioContext *ctx)
+{
+    int err;
+
+    err = snd_pcm_open(&ctx->pcm, ctx->device,
+                       SND_PCM_STREAM_PLAYBACK, 0);
+    if (err < 0) {
+        fprintf(stderr, "audio: cannot open device '%s': %s\n",
+                ctx->device, snd_strerror(err));
+        return -1;
+    }
+
+    snd_pcm_hw_params_t *hw_params;
+    snd_pcm_hw_params_alloca(&hw_params);
+    snd_pcm_hw_params_any(ctx->pcm, hw_params);
+
+    snd_pcm_hw_params_set_access(ctx->pcm, hw_params,
+                                 SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(ctx->pcm, hw_params, ALSA_FORMAT);
+    snd_pcm_hw_params_set_channels(ctx->pcm, hw_params,
+                                   (unsigned int)ctx->channels);
+
+    unsigned int rate = (unsigned int)ctx->sample_rate;
+    snd_pcm_hw_params_set_rate_near(ctx->pcm, hw_params, &rate, 0);
+
+    snd_pcm_uframes_t buffer_size = (snd_pcm_uframes_t)(ctx->sample_rate / 5);
+    snd_pcm_uframes_t period_size = buffer_size / 4;
+    snd_pcm_hw_params_set_buffer_size_near(ctx->pcm, hw_params, &buffer_size);
+    snd_pcm_hw_params_set_period_size_near(ctx->pcm, hw_params,
+                                           &period_size, NULL);
+
+    err = snd_pcm_hw_params(ctx->pcm, hw_params);
+    if (err < 0) {
+        fprintf(stderr, "audio: cannot set hw params: %s\n",
+                snd_strerror(err));
+        snd_pcm_close(ctx->pcm);
+        ctx->pcm = NULL;
+        return -1;
+    }
+
+    snd_pcm_sw_params_t *sw_params;
+    snd_pcm_sw_params_alloca(&sw_params);
+    snd_pcm_sw_params_current(ctx->pcm, sw_params);
+    snd_pcm_sw_params_set_start_threshold(ctx->pcm, sw_params, period_size);
+    snd_pcm_sw_params(ctx->pcm, sw_params);
+
+    /* Log actual negotiated values */
+    snd_pcm_uframes_t actual_buffer = 0, actual_period = 0;
+    snd_pcm_hw_params_get_buffer_size(hw_params, &actual_buffer);
+    snd_pcm_hw_params_get_period_size(hw_params, &actual_period, NULL);
+
+    vlog("audio: ALSA opened — device=%s rate=%u buffer=%lu period=%lu\n",
+            ctx->device, rate,
+            (unsigned long)actual_buffer, (unsigned long)actual_period);
+
+    return 0;
+}
+
+/*
+ * Close and reopen the ALSA PCM device.  Used to recover from
+ * persistent errors (e.g. HDMI state changes during playback).
+ */
+static int audio_reopen_alsa(AudioContext *ctx)
+{
+    fprintf(stderr, "audio: reopening ALSA device '%s'\n", ctx->device);
+
+    if (ctx->pcm) {
+        snd_pcm_drop(ctx->pcm);
+        snd_pcm_close(ctx->pcm);
+        ctx->pcm = NULL;
+    }
+
+    /* Small delay to let HDMI/DRM settle */
+    usleep(ALSA_REOPEN_DELAY_US);
+
+    int ret = alsa_open_device(ctx);
+    if (ret == 0)
+        ctx->frames_written = 0;
+    else
+        fprintf(stderr, "audio: ALSA reopen FAILED\n");
+
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
+
 int audio_open(AudioContext *ctx, AVStream *stream,
                const char *device, Queue *audio_queue)
 {
-    int err;
     memset(ctx, 0, sizeof(*ctx));
 
     ctx->audio_queue    = audio_queue;
@@ -106,8 +212,9 @@ int audio_open(AudioContext *ctx, AVStream *stream,
         return -1;
     }
 
-    vlog("audio: decoder opened — %s %d Hz %d ch\n",
-            codec->name, ctx->sample_rate, ctx->channels);
+    vlog("audio: decoder opened — %s %d Hz %d ch (fmt=%s)\n",
+            codec->name, ctx->sample_rate, ctx->channels,
+            av_get_sample_fmt_name(ctx->codec_ctx->sample_fmt));
 
     /* ------------------------------------------------------------------ */
     /* 2. Initialise swresample: float-planar → S16 interleaved            */
@@ -136,48 +243,8 @@ int audio_open(AudioContext *ctx, AVStream *stream,
     /* ------------------------------------------------------------------ */
     /* 3. Open ALSA PCM device                                             */
     /* ------------------------------------------------------------------ */
-    err = snd_pcm_open(&ctx->pcm, ctx->device,
-                       SND_PCM_STREAM_PLAYBACK, 0);
-    if (err < 0) {
-        fprintf(stderr, "audio: cannot open device '%s': %s\n",
-                ctx->device, snd_strerror(err));
+    if (alsa_open_device(ctx) < 0)
         return -1;
-    }
-
-    snd_pcm_hw_params_t *hw_params;
-    snd_pcm_hw_params_alloca(&hw_params);
-    snd_pcm_hw_params_any(ctx->pcm, hw_params);
-
-    snd_pcm_hw_params_set_access(ctx->pcm, hw_params,
-                                 SND_PCM_ACCESS_RW_INTERLEAVED);
-    snd_pcm_hw_params_set_format(ctx->pcm, hw_params, ALSA_FORMAT);
-    snd_pcm_hw_params_set_channels(ctx->pcm, hw_params,
-                                   (unsigned int)ctx->channels);
-
-    unsigned int rate = (unsigned int)ctx->sample_rate;
-    snd_pcm_hw_params_set_rate_near(ctx->pcm, hw_params, &rate, 0);
-
-    snd_pcm_uframes_t buffer_size = (snd_pcm_uframes_t)(ctx->sample_rate / 5);
-    snd_pcm_uframes_t period_size = buffer_size / 4;
-    snd_pcm_hw_params_set_buffer_size_near(ctx->pcm, hw_params, &buffer_size);
-    snd_pcm_hw_params_set_period_size_near(ctx->pcm, hw_params,
-                                           &period_size, NULL);
-
-    err = snd_pcm_hw_params(ctx->pcm, hw_params);
-    if (err < 0) {
-        fprintf(stderr, "audio: cannot set hw params: %s\n",
-                snd_strerror(err));
-        return -1;
-    }
-
-    snd_pcm_sw_params_t *sw_params;
-    snd_pcm_sw_params_alloca(&sw_params);
-    snd_pcm_sw_params_current(ctx->pcm, sw_params);
-    snd_pcm_sw_params_set_start_threshold(ctx->pcm, sw_params, period_size);
-    snd_pcm_sw_params(ctx->pcm, sw_params);
-
-    vlog("audio: ALSA opened — device=%s rate=%u\n",
-            ctx->device, rate);
 
     return 0;
 }
@@ -211,13 +278,17 @@ void audio_resume(AudioContext *ctx)
 
 void audio_run(AudioContext *ctx)
 {
-    AVPacket *pkt   = av_packet_alloc();
-    AVFrame  *frame = av_frame_alloc();
-
-    if (!pkt || !frame) {
-        fprintf(stderr, "audio: alloc failed\n");
-        goto done;
+    AVFrame *frame = av_frame_alloc();
+    if (!frame) {
+        fprintf(stderr, "audio: frame alloc failed\n");
+        return;
     }
+
+    int consecutive_errors = 0;
+    int total_frames       = 0;
+    int total_errors       = 0;
+
+    fprintf(stderr, "audio: playback thread started\n");
 
     while (1) {
         /* Block while paused */
@@ -229,19 +300,46 @@ void audio_run(AudioContext *ctx)
         /* Pull next packet from queue */
         void *item = NULL;
         if (!queue_pop(ctx->audio_queue, &item))
-            break;
+            break;       /* queue closed — EOS */
 
-        pkt = (AVPacket *)item;
+        /* Decode the packet.  Note: pkt is local — no leak. */
+        AVPacket *pkt = (AVPacket *)item;
 
         if (avcodec_send_packet(ctx->codec_ctx, pkt) < 0) {
             av_packet_free(&pkt);
-            pkt = av_packet_alloc();
             continue;
         }
         av_packet_free(&pkt);
-        pkt = av_packet_alloc();
 
         while (avcodec_receive_frame(ctx->codec_ctx, frame) == 0) {
+            total_frames++;
+
+            /* Log first decoded frame for diagnostics */
+            if (total_frames == 1) {
+                fprintf(stderr,
+                    "audio: first decoded frame — fmt=%s rate=%d ch=%d "
+                    "samples=%d (configured: rate=%d ch=%d)\n",
+                    av_get_sample_fmt_name(frame->format),
+                    frame->sample_rate,
+                    get_frame_channels(frame),
+                    frame->nb_samples,
+                    ctx->sample_rate,
+                    ctx->channels);
+
+                /* Warn if decoded format doesn't match configured */
+                if (frame->sample_rate != ctx->sample_rate) {
+                    fprintf(stderr,
+                        "audio: WARNING — frame rate %d != configured %d "
+                        "(potential HE-AAC SBR mismatch)\n",
+                        frame->sample_rate, ctx->sample_rate);
+                }
+            }
+
+            /* Periodic progress log (every ~21s at 48 kHz) */
+            if (total_frames % 1000 == 0)
+                vlog("audio: progress — %d frames, %d errors, "
+                     "%lld ALSA frames written\n",
+                     total_frames, total_errors, ctx->frames_written);
 
             /* Check pause again between frames */
             pthread_mutex_lock(&ctx->pause_mutex);
@@ -263,7 +361,7 @@ void audio_run(AudioContext *ctx)
                                         (const uint8_t **)frame->data,
                                         frame->nb_samples);
 
-            if (converted > 0 && out_buf) {
+            if (converted > 0 && out_buf && ctx->pcm) {
                 /* Apply software volume gain or mute */
                 float gain = ctx->muted ? 0.0f : ctx->volume;
                 if (gain != 1.0f) {
@@ -282,26 +380,44 @@ void audio_run(AudioContext *ctx)
                                    (snd_pcm_uframes_t)converted);
 
                 if (written < 0) {
-                    /* Use snd_pcm_recover for robust error handling.
-                     * This handles EPIPE (underrun), ESTRPIPE (suspend),
-                     * and EINTR.  For other errors (EFAULT, EBADFD) we
-                     * try a manual prepare cycle. */
-                    int rc = snd_pcm_recover(ctx->pcm, (int)written, 1);
-                    if (rc < 0) {
-                        /* recover() failed — force prepare and retry */
-                        snd_pcm_drop(ctx->pcm);
-                        snd_pcm_prepare(ctx->pcm);
+                    total_errors++;
+                    consecutive_errors++;
+
+                    if (consecutive_errors >= ALSA_REOPEN_THRESHOLD) {
+                        /* Persistent failure — fully reopen ALSA device */
+                        fprintf(stderr,
+                            "audio: %d consecutive errors, "
+                            "attempting ALSA device reopen\n",
+                            consecutive_errors);
+
+                        if (audio_reopen_alsa(ctx) == 0) {
+                            consecutive_errors = 0;
+                            /* Retry after reopen */
+                            written = snd_pcm_writei(ctx->pcm, out_buf,
+                                        (snd_pcm_uframes_t)converted);
+                        }
+                    } else {
+                        /* Normal recovery path: recover + retry */
+                        int rc = snd_pcm_recover(ctx->pcm, (int)written, 1);
+                        if (rc < 0) {
+                            snd_pcm_drop(ctx->pcm);
+                            snd_pcm_prepare(ctx->pcm);
+                        }
+                        written = snd_pcm_writei(ctx->pcm, out_buf,
+                                    (snd_pcm_uframes_t)converted);
                     }
-                    /* Retry the write once after recovery */
-                    written = snd_pcm_writei(ctx->pcm, out_buf,
-                                             (snd_pcm_uframes_t)converted);
-                    if (written < 0 && !ctx->paused) {
-                        /* Still failing — rate-limit logging */
-                        static int err_count = 0;
-                        if (++err_count <= 3 || err_count % 100 == 0)
-                            fprintf(stderr, "audio: write error (%d): %s\n",
-                                    err_count, snd_strerror((int)written));
+
+                    if (written < 0) {
+                        if (total_errors <= 5 || total_errors % 200 == 0)
+                            fprintf(stderr,
+                                "audio: write error #%d (consec=%d): %s\n",
+                                total_errors, consecutive_errors,
+                                snd_strerror((int)written));
+                    } else {
+                        consecutive_errors = 0;
                     }
+                } else {
+                    consecutive_errors = 0;
                 }
 
                 if (written > 0)
@@ -313,8 +429,9 @@ void audio_run(AudioContext *ctx)
         }
     }
 
-done:
-    av_packet_free(&pkt);
+    fprintf(stderr, "audio: thread exiting (decoded=%d errors=%d "
+            "frames_written=%lld)\n",
+            total_frames, total_errors, ctx->frames_written);
     av_frame_free(&frame);
 }
 
