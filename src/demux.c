@@ -15,6 +15,23 @@ int demux_open(DemuxContext *ctx, const char *filename,
     ctx->video_queue      = video_queue;
     ctx->audio_queue      = audio_queue;
 
+    /*
+     * Pre-allocate the format context so that memory limits are in effect
+     * DURING avformat_open_input — not just for find_stream_info.
+     * This is critical on Pi Zero 2W (512 MB total, ~150 MB available)
+     * where the HLS demuxer downloading multiple variant playlists and
+     * init segments during open can spike memory past the OOM threshold.
+     *
+     * Defaults: probesize=5MB, max_analyze_duration=5s — far too much.
+     */
+    ctx->fmt_ctx = avformat_alloc_context();
+    if (!ctx->fmt_ctx) {
+        fprintf(stderr, "demux: failed to alloc format context\n");
+        return -1;
+    }
+    ctx->fmt_ctx->probesize            = 512 * 1024;        /* 512 KB */
+    ctx->fmt_ctx->max_analyze_duration = 2 * AV_TIME_BASE;  /* 2 seconds */
+
     AVDictionary *opts = NULL;
     if (hls_max_bandwidth > 0) {
         char bw_str[32];
@@ -28,13 +45,6 @@ int demux_open(DemuxContext *ctx, const char *filename,
         return -1;
     }
     av_dict_free(&opts);
-
-    /* Reduce memory footprint during stream analysis — important on Pi Zero
-     * where RAM is very limited (512MB total).  Default probesize is 5MB and
-     * analyzeduration is 5s; lowering them saves several MB of read-ahead
-     * buffers when opening HLS streams with multiple variants. */
-    ctx->fmt_ctx->probesize          = 1 * 1024 * 1024;   /* 1 MB */
-    ctx->fmt_ctx->max_analyze_duration = 3 * AV_TIME_BASE; /* 3 seconds */
 
     if (avformat_find_stream_info(ctx->fmt_ctx, NULL) < 0) {
         fprintf(stderr, "demux: could not find stream info\n");
@@ -97,6 +107,15 @@ int demux_open(DemuxContext *ctx, const char *filename,
                 as->codecpar->channels
 #endif
                 );
+    }
+
+    /* Discard streams we don't use — frees their codec parsing state and
+     * (for HLS) tells the demuxer it can skip downloading segments for
+     * those variants.  Important for memory on Pi Zero. */
+    for (unsigned int i = 0; i < ctx->fmt_ctx->nb_streams; i++) {
+        if ((int)i != ctx->video_stream_idx &&
+            (int)i != ctx->audio_stream_idx)
+            ctx->fmt_ctx->streams[i]->discard = AVDISCARD_ALL;
     }
 
     vlog("demux: duration %.1f s\n", ctx->duration_us / 1e6);
