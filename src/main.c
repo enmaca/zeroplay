@@ -77,6 +77,7 @@ static void print_usage(void)
         "  --vol n                 initial volume 0-200 (default 100)\n"
         "  --pos n                 start position in seconds (video only)\n"
         "  --audio-device dev      ALSA device (default: auto-detect)\n"
+        "  --hls-bitrate BPS       max HLS bandwidth in bps (or HLS_MAX_BANDWIDTH env)\n"
         "  --image-duration n      seconds per image (default 10, 0 = hold forever)\n"
         "  --verbose               print decoder/driver info\n"
         "  --help                  show this message\n"
@@ -85,7 +86,6 @@ static void print_usage(void)
         "  --ws-url URL            backend WebSocket URL (or BACKEND_WS_URL env)\n"
         "  --device-token TOKEN    device auth token (or DEVICE_TOKEN env)\n"
         "  --health-port PORT      health HTTP port (default 3000, or HEALTH_PORT env)\n"
-        "  --hls-bitrate BPS       max HLS bandwidth in bps (or HLS_MAX_BANDWIDTH env)\n"
         "\n"
         "controls:\n"
         "  p / space               pause / resume\n"
@@ -155,8 +155,8 @@ static int parse_args(int argc, char *argv[], Options *opt)
     if (opt->health_port == 0) {
         const char *hp = getenv("HEALTH_PORT");
         opt->health_port = hp ? atoi(hp) : 3000;
-#endif
     }
+#endif
     if (opt->hls_max_bandwidth == 0) {
         const char *hb = getenv("HLS_MAX_BANDWIDTH");
         if (!hb) hb = getenv("MPV_HLS_BITRATE");
@@ -843,7 +843,6 @@ int main(int argc, char *argv[])
     avformat_network_init();
 
 #ifdef HAVE_WEBSOCKET
-    /* WebSocket mode — idle start, commands via ws */
     if (opt.ws_url && opt.ws_url[0]) {
         if (!opt.device_token || !opt.device_token[0]) {
             fprintf(stderr, "zeroplay: --device-token required with --ws-url\n");
@@ -853,9 +852,7 @@ int main(int argc, char *argv[])
         avformat_network_deinit();
         return ret;
     }
-
 #endif
-    /* --- Legacy standalone mode below --- */
 
     DrmContext drm;
     if (drm_open(&drm) < 0)
